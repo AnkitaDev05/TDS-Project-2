@@ -24,9 +24,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import traceback
-import base64
 import re
 
+from dateutil import parser
+from sklearn.linear_model import LinearRegression
+from sklearn.cluster import KMeans
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.impute import SimpleImputer
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.tsa.seasonal import seasonal_decompose
 
 # Load environment variables from .env file
 def load_env_key():
@@ -95,9 +108,36 @@ def load_dataset(dataset_filename):
         logging.error(f"Error loading dataset from {dataset_filename}: {e}")
         sys.exit(1)
 
-def encode_image(image_path):
-    with open(image_path, 'rb') as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
+# Writing to file
+def write_file(name, text_content,title=None):
+    """Write text content to a file, optionally adding a title."""
+
+    logging.info(f'Writing README.md to directory: {name}')
+
+    # Ensure directory exists
+    if not os.path.exists(name):
+        logging.info(f"Directory {name} does not exist, creating it.")
+        os.makedirs(name, exist_ok=True)
+
+    try:
+        with open(os.path.join(name, "README.md"), "w", encoding="utf-8") as f:
+            # If a title is provided, add it to the top of the file
+            if title:
+                f.write("# " + title + "\n\n")
+
+            # If content starts with a markdown block, strip it out properly    
+            if text_content.startswith("```markdown"):
+                text_content = text_content[11:].strip()  # Remove the ```markdown part
+                if text_content.endswith("```"):
+                    text_content = text_content[:-3].strip()  # Remove the closing ```
+            
+            # Write the content to the file
+            f.write(text_content + "\n\n")
+        logging.info(f"Successfully written to {name}/README.md")
+
+    except Exception as e:
+        logging.error(f"Error writing README.md: {e}")
+
 
 # Data cleaning
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -123,19 +163,9 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     return df_cleaned
 
 
-# Sends a prompt to the GPT model and returns the model's response.   
-def chat(prompt, api_key, model='gpt-4o-mini'):
-    """
-    Sends a user prompt to the OpenAI API and returns the model's response.
-
-    Args:
-        prompt (str): The message to be sent to the model.
-        api_key (str): The API key for authentication.
-        model (str, optional): The model to be used (default is 'gpt-4o-mini').
-
-    Returns:
-        str: The model's response or None if an error occurs.
-        """
+# AI Proxy 'Function Call' Functions
+def chat_function_call(prompt, api_key, function_descriptions, model='gpt-4o-mini'):
+    """Call an AI API for a function completion based on user input."""
     
     url = 'https://aiproxy.sanand.workers.dev/openai/v1/chat/completions'
     headers = {
@@ -145,50 +175,114 @@ def chat(prompt, api_key, model='gpt-4o-mini'):
     data = {
         'model': model,
         'messages': [
-            {
-                'role': 'system',
-                'content': 'You are a data science expert. Provide clear, concise, and actionable answers.'
-            },
-            {
-                'role': 'user',
-                'content': prompt
-            }
+            {'role': 'system','content': "You are a data science expert with expertise in machine learning, statistics, and data analysis. Provide clear, concise, and actionable answers."},
+            {'role': 'user','content': prompt}
         ],
-        'temperature': 0.7,
-        'max_tokens': 100
+        'functions': function_descriptions,
+        'function_call': 'auto',
+        'max_tokens': 200
     }
-
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=30)
+        response = requests.post(url, headers=headers, json=data)
         response.raise_for_status()
         output = response.json()
 
-        if output.get('error', None):
-            logging.error(f"LLM Error during chat with prompt '{prompt[:30]}...'. Error: {output}")
+        if output.get('error'):
+            logging.error(f"LLM Error: {output}")
             return None
-
-        monthly_cost = output.get('monthlyCost', 'N/A')
-        logging.info(f"Chat completion successful for prompt '{prompt[:30]}...'. Monthly Cost: {monthly_cost}")
-        return output['choices'][0]['message']['content']
+        
+        logging.info(f"Monthly Cost: {output.get('monthlyCost', None)}")
+        
+        return {
+            'arguments': output['choices'][0]['message']['function_call']['arguments'],
+            'name': output['choices'][0]['message']['function_call']['name']
+        }
     except requests.exceptions.RequestException as e:
-        logging.error(f"Request failed for chat. Error: {e}")
+        logging.error(f"HTTP Request failed: {e}")
+        return None
+    except (KeyError, IndexError) as e:
+        logging.error(f"Unexpected response format: {e}")
         return None
 
-# Analysis
 
-from sklearn.linear_model import LinearRegression
-from sklearn.cluster import KMeans
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.metrics import confusion_matrix, classification_report
-from sklearn.impute import SimpleImputer
-from statsmodels.tsa.stattools import adfuller
-from statsmodels.tsa.seasonal import seasonal_decompose
+filter_function_descriptions = [
+    {
+        'name': 'filter_features',
+        'description': 'Generic function to extract data from a dataset.',
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "features": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "List of column names to keep. Eg. ['language', 'quality']",
+                },
+            },
+            "required": ["features"]
+        }
+    },
+    {
+        'name': 'extract_features_and_target',
+        'description': 'Use this to extract feature matrix (X) and target vector (y) for model training tasks (regression, classification)',
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "features": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "List of feature columns, e.g., ['n_rooms', 'locality', 'latitude']",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Name of the target column, e.g., 'price'",
+                },
+            },
+            "required": ["features", "target"]
+        }
+    },
+    {
+        'name': 'extract_time_series_data',
+        'description': "Extract date/time column and numerical column for time series analysis.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "date_column": {
+                    "type": "string",
+                    "description": "Name of the date column.",
+                },
+                "numerical_column": {
+                    "type": "string",
+                    "description": "Name of the numerical column, e.g., 'price'",
+                }
+            },
+            "required": ["date_column", "numerical_column"]
+        }
+    },
+    ]
+
+def filter_features(data, features):
+    """Filters the specified features from the input DataFrame and returns a copy of the filtered data."""
+    return data[features].copy()
+
+
+def extract_features_and_target(data, features, target):
+    """Extracts the specified features and target column from the input DataFrame."""
+    return data[features].copy(), data[target].copy()
+
+
+def extract_time_series_data(data, date_column, numerical_column):
+    """Extracts the date and numerical columns from the input DataFrame for time series analysis."""
+    if date_column not in data.columns or numerical_column not in data.columns:
+        logging.error(f"ERROR Columns '{date_column}' or '{numerical_column}' not found in the data.")
+    return data[date_column].copy(), data[numerical_column].copy()
+
+
+
+# Analysis
 
 # Generic analysis 
 def generic_analysis(df):
@@ -216,6 +310,10 @@ def generic_analysis(df):
         df_cleaned = clean_data(df)
         if df_cleaned.empty:
             raise ValueError("The DataFrame is empty") 
+
+        # First 3 rows
+        analysis['first_3'] = df_cleaned.head(3).to_dict()
+        logging.info("Extracted first 3 rows.")
 
         # Summary statistics for numeric columns
         numeric_columns = df_cleaned.select_dtypes(include='number')
@@ -257,8 +355,15 @@ def outlier_plot(name,df):
     numeric_cols = df_cleaned.select_dtypes(include=[np.number]).columns
     if len(numeric_cols) > 0:
         plt.figure(figsize=(10, 8),dpi=100)
-        sns.boxplot(data=df_cleaned[numeric_cols])
-        chart_file_name = f"{name}/outlier_plot.png"
+        sns.set_theme(style="whitegrid")  # Adds a clean background with gridlines
+        num_cols = len(df_cleaned[numeric_cols].columns)
+        palette = sns.color_palette("bright", num_cols)
+        sns.boxplot(data=df_cleaned[numeric_cols], palette=palette)
+        plt.xticks(rotation=45, ha='right')
+        plt.title('Outlier Plot', fontsize=18, fontweight='bold')
+        plt.xlabel('Features', fontsize=16, fontweight='bold')
+        plt.ylabel('Values', fontsize=16, fontweight='bold')
+        chart_file_name = os.path.join(name, "outlier_plot.png")
         plt.savefig(chart_file_name, dpi=100)
         plt.close()
         logging.info(f"Outlier plot saved as {chart_file_name}")
@@ -277,8 +382,9 @@ def correlation_matrix(name, df):
     if not numeric_data.empty:
         plt.figure(figsize=(10, 8),dpi=100)
         sns.heatmap(numeric_data.corr(), annot=True, fmt=".2f", cmap='coolwarm', cbar=True, square=True)
-        plt.title('Correlation Matrix')
-        chart_file_name = f"{name}/correlation_matrix.png"
+        plt.title('Correlation Matrix', fontsize=18, fontweight='bold')
+        plt.tight_layout()
+        chart_file_name = os.path.join(name, "correlation_matrix.png")
         plt.savefig(chart_file_name, dpi = 100)
         plt.close()
         logging.info(f"Correlation matrix saved as {chart_file_name}")
@@ -289,85 +395,9 @@ def correlation_matrix(name, df):
 
 
 # Non-generic analysis
-def perform_ml_analysis(name, df, api_key):
-    """
-    Perform in-depth analysis by consulting a language model (LLM) to suggest 
-    appropriate machine learning techniques based on the provided dataset.
-    """
-
-    # Extract column names and a sample of the dataset to pass to LLM   
-    column_info = df.columns.tolist()
-    example_data = df.head(1).to_dict(orient="records")
-    
-    # Define a list of machine learning techniques
-    ml_techniques = ['regression' , 'clustering', 'classification', 'time series']
-    
-    # Generate a detailed prompt to ask the LLM for appropriate techniques based on the dataset
-    prompt = f"""
-    Dataset columns: {column_info}. Sample: {example_data}.
-    Suggest most suitable machine learning technique (only 1) strictly from this list: {ml_techniques} 
-    Output format: {{"techniques": ["technique"]}}
-    If none, return an empty list.
-    """
-    
-    # Get technique suggestions from LLM
-    try:
-        analysis_suggestion = chat(prompt, api_key)
-        if not analysis_suggestion:
-            logging.error("LLM returned no analysis suggestion.")
-            return None
-    except Exception as e:
-        logging.error(f"Error while querying LLM: {e}")
-        return None
-    
-    # Parse the LLM response
-    try:
-        analysis_suggestion = analysis_suggestion.strip()       
-        if analysis_suggestion.startswith('{"techniques":'):
-            response_data = json.loads(analysis_suggestion)
-            
-            # Extract the list of techniques
-            techniques = response_data.get("techniques", [])
-            
-            # Ensure the techniques are in the proper format (a list)
-            if isinstance(techniques, list):
-                if techniques:  # If the list is not empty
-                    logging.info(f"LLM suggested techniques: {techniques}")
-                else:
-                    logging.info("LLM suggested no techniques.")
-                    return None
-            else:
-                logging.error("Expected 'techniques' to be a list.")
-                return None
-        else:
-            logging.error(f"Unexpected format in LLM response: {analysis_suggestion}")
-            return None    
-        
-        # Execute the suggested techniques.
-        ml_results = {}
-
-        for technique in techniques:
-            technique = technique.strip().lower()  
-            if technique == 'regression':
-                logging.info("Performing Regression.")
-                ml_results['Regression'] = regression(df, api_key)
-            elif technique == 'clustering':
-                logging.info("Performing Clustering.")
-                ml_results['Clustering'] = kmeans_clustering(df, name, n_clusters=3)
-            elif technique == 'classification':
-                logging.info("Performing Classification.")
-                ml_results['Classification'] = classification(name, df, api_key)
-            elif technique == 'time series':     
-                logging.info("Performing Time Series.")          
-                ml_results['Time Series'] = time_series(name, df, api_key)
-        
-        return ml_results
-    except Exception as e:
-        logging.error(f"Error parsing the LLM response: {e}")
-        return None
 
 # Perform Regression based on LLM suggestion
-def regression(df, api_key):
+def regression(name, df, api_key):
     """
     Performs linear regression on the given dataset based on column suggestions from a language model.
     The function cleans the dataset, obtains feature and target column suggestions from the LLM,
@@ -387,84 +417,80 @@ def regression(df, api_key):
         return None
     
     # Extract column names and a sample of the dataset to pass to LLM   
-    column_info = df_cleaned.columns.tolist()
+    column_info = "\n".join([f"{col}: {dtype}" for col, dtype in df_cleaned.dtypes.items()])
     example_data = df_cleaned.head(1).to_dict(orient="records")
 
     # Send a prompt to the LLM to suggest appropriate columns for regression
     prompt = f"""\
         Dataset columns: {column_info}. Sample row: {example_data}.
-        Task: Identify the relevant feature columns (only 2) and the target column for a regression task. Exclude the target column from the feature set. Return the names of the selected columns.
-        Output format:
-        {{"features": ["feature1", "feature2"],"target": "target_column"}}
+        Task: Identify the relevant feature columns and the target column for a regression task. Exclude the target column from the feature set.
         """
     
-    # Get column selection suggestion from LLM
-    column_suggestion = chat(prompt, api_key)
+    response = chat_function_call(prompt=prompt, api_key=api_key, function_descriptions=filter_function_descriptions)
     
-    if not column_suggestion:
+    if not response:
         logging.error("Failed to get column suggestion for regression from LLM.")
         return None
-
-    logging.info(f"LLM suggested columns for regression: {column_suggestion}")
-
+ 
     try:
-        # Parse the suggested columns from the LLM response 
-        parsed_response = json.loads(column_suggestion.strip())
-        print(parsed_response)
-        # Extract features and target columns
-        selected_features = parsed_response.get("features", [])
-        target_column = parsed_response.get("target", None) 
+        try:
+            params = json.loads(response['arguments'])
+            chosen_func = eval(response['name'])  
+        except (json.JSONDecodeError, NameError, SyntaxError) as e:
+            logging.error(f"Error processing response: {e}")
+            return None 
 
-        if not selected_features or not target_column:
-            logging.error("LLM didn't provide valid columns for regression.")
+        if 'target' not in params.keys():
+            logging.error("Target variable not found in the parameters.")
             return None
         
-        # Ensure the target column and feature columns exist in the dataframe
-        missing_columns = [col for col in [target_column] + selected_features if col not in df_cleaned.columns]
-        if missing_columns:
-            logging.error(f"Missing columns in dataset: {missing_columns}")
-            return None
-        
-        logging.info(f"Selected features: {selected_features}")
-        logging.info(f"Target column: {target_column}")
+        params['features'] = list(filter(lambda feature: feature != params['target'], params['features']))
 
-        df_cleaned = df_cleaned.dropna(subset=selected_features + [target_column])
-        # Perform the regression using the selected columns
-        X = df_cleaned[selected_features].values
-        y = np.ravel(df_cleaned[target_column].values)  # Ensure y is 1D
-        
-        # Ensure we have enough rows for regression
-        if X.shape[0] < 5 or y.shape[0] < 5:
-            logging.warning("Not enough data to perform regression.")
+        X, y = chosen_func(data=df_cleaned, **params)
+        X = X.select_dtypes(include=['number'])
+
+        if X.empty:
+            logging.warning("No numeric columns found in the dataset.")
             return None
 
-        # Train-test split
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        
-        # Standardize data
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_test = scaler.transform(X_test)
 
-        # Perform linear regression
-        model = LinearRegression()
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
+        # Create a regression pipeline with additional model options (e.g., Ridge, Lasso)
+        pipe = Pipeline([
+            ('imputer', SimpleImputer(strategy='mean')),
+            ('scaler', StandardScaler()),
+            ('regression', LinearRegression())  # Can be changed to Ridge or Lasso for regularization
+        ])
 
-        # Calculate evaluation metrics
-        mse = mean_squared_error(y_test, y_pred)
+        logging.info('Training Linear Regression Model')
+
+        pipe.fit(X_train, y_train)
+        y_pred = pipe.predict(X_test)
+
+        r2_score = pipe.score(X_test, y_test)
         mae = mean_absolute_error(y_test, y_pred)
-        r2 = r2_score(y_test, y_pred)
+        mse = mean_squared_error(y_test, y_pred)
+        rmse = mse ** 0.5
 
-        logging.info(f"Mean Squared Error: {mse}")
-        logging.info(f"Mean Absolute Error: {mae}")
-        logging.info(f"R-squared: {r2}")
-
+        regression_plot(name=name, y_true=y_test, y_pred=y_pred)  
+        logging.info(f"""
+                     'r2_score': {r2_score},'mae': {mae}, 
+                     'mse': {mse},'rmse': {rmse},
+                     'coefficient': {pipe['regression'].coef_},
+                     'intercept': {pipe['regression'].intercept_},
+                     'feature_names_input': {list(X.columns)},
+                     'target_name': {y.name},
+                     """)
         return {
-        "mse": mse,
-        "mae": mae,
-        "r2": r2
-    }
+            'r2_score': r2_score,
+            'mae': mae,
+            'mse': mse,
+            'rmse': rmse,
+            'coefficient': pipe['regression'].coef_,
+            'intercept': pipe['regression'].intercept_,
+            'feature_names_input': list(X.columns),
+            'target_name': y.name,
+        }
 
     except Exception as e:
         logging.error(f"Error performing regression: {e}")
@@ -482,7 +508,7 @@ def classification(name, df, api_key):
         api_key (str): The API key for accessing the GPT model to suggest relevant columns.
 
     Returns:
-        dict: A dictionary containing the accuracy, classification report, and confusion matrix chart filename.
+        dict: A dictionary containing the accuracy, classification report.
               Returns None if an error occurs.
     """
     if df.empty:
@@ -495,53 +521,62 @@ def classification(name, df, api_key):
         logging.error("The Dataframe is empty after cleaning.")
         return None
     
-     # Extract column names and a sample of the dataset to pass to LLM   
-    column_info = df_cleaned.columns.tolist()
+    # Extract column names and a sample of the dataset to pass to LLM   
+    column_info = "\n".join([f"{col}: {dtype}" for col, dtype in df_cleaned.dtypes.items()])
     example_data = df_cleaned.head(1).to_dict(orient="records")
 
     # Send a prompt to the LLM to suggest appropriate columns for classification
     prompt = f"""\
         Dataset columns: {column_info}. Sample row: {example_data}.
-        Task: Identify the relevant feature columns (limit 4) and the target column for a classification task (confusion matrix).Exclude the target column from the feature set. Return the names of the selected columns.
-        Output format:
-        {{"features": ["feature1", "feature2",...],"target": "target_column"}}
+        Task: Identify the relevant feature columns and the target column for a classification task. Exclude the target column from the feature set. Target column should be categorical datatype. Hint: Use function extract_features_and_target.
         """
     
-    # Get column selection suggestion from LLM
-    column_suggestion = chat(prompt, api_key)
-    
-    if not column_suggestion:
+    response = chat_function_call(prompt=prompt, api_key=api_key, function_descriptions=filter_function_descriptions)
+    logging.info(f"AI Response: {response}")
+    if not response:
         logging.error("Failed to get column suggestion for classification from LLM.")
-        return None
-
+        return None   
      # Parse the LLM output 
     try:
-        # Parse the suggested columns from the LLM response 
-        column_suggestion = json.loads(column_suggestion.strip())
+        params = json.loads(response['arguments'])
+        logging.info(f"Parsed Params: {params}")  
+    except (json.JSONDecodeError, NameError, SyntaxError) as e:
+        logging.error(f"Error processing response: {e}")
+        return None 
 
-        # Extract features and target columns
-        features = column_suggestion.get('features', [])
-        target = column_suggestion.get('target', None)
-
-        # Validate the suggestion
-        if not features or not target:
-            logging.error("LLM did not provide valid feature or target columns.")
-            return None
-
-        logging.info(f"LLM suggested columns for classification: Features: {features}, Target: {target}")
-
-        # Ensure the target column and feature columns exist in the dataframe
-        missing_columns = [col for col in [target] + features if col not in df_cleaned.columns]
-        if missing_columns:
-            logging.error(f"Missing columns in dataset: {missing_columns}")
-            return None
-
-    except Exception as e:
-        logging.error(f"Error while parsing LLM suggestion: {e}")
+    if not any('target' == key.strip().lower() for key in params.keys()):
+        logging.error("Target variable not found in the parameters.")
+        logging.error(params)
         return None
+    
+    target = params['target']
+    features = list(filter(lambda feature: feature != target, params['features']))
+
+    if target not in df_cleaned.columns:
+        logging.error(f"The target column '{target}' does not exist in the dataframe.")
+        return None
+    
+    missing_features = [feature for feature in features if feature not in df_cleaned.columns]
+    if missing_features:
+        logging.error(f"The following feature columns are missing from the dataframe: {missing_features}")
+        return None
+
+
     try:
+        X = df_cleaned[features].select_dtypes(include=['number'])
+        y = df_cleaned[target]
+
+
+        if y.nunique() > 20:
+            logging.warning('Target variable has too many unique values for classification.')
+            return None
+
+        if X.empty:
+            logging.warning("No numeric columns found for features.")
+            return None
+        
+        # Drop rows with missing values in features or target
         df_cleaned = df_cleaned.dropna(subset=features + [target])
-        # Select features and target from the dataframe
         X = df_cleaned[features]
         y = df_cleaned[target]
 
@@ -558,12 +593,8 @@ def classification(name, df, api_key):
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
         
         # Preprocessing for numerical and categorical features
-        numeric_transformer = Pipeline(steps=[
-            ('scaler', StandardScaler())
-        ])
-        categorical_transformer = Pipeline(steps=[
-            ('encoder', OneHotEncoder(handle_unknown='ignore'))
-        ])
+        numeric_transformer = Pipeline(steps=[('scaler', StandardScaler())])
+        categorical_transformer = Pipeline(steps=[('encoder', OneHotEncoder(handle_unknown='ignore'))])
         
         # Combine both transformations into a single column transformer
         preprocessor = ColumnTransformer(
@@ -582,23 +613,19 @@ def classification(name, df, api_key):
         
         y_pred = model.predict(X_test)
         accuracy = accuracy_score(y_test, y_pred)
-        cm = confusion_matrix(y_test, y_pred)
         report = classification_report(y_test, y_pred)
         
         # Get unique class labels for multi-class
         labels = sorted(y_test.unique())
-        # Visualize the confusion matrix
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels, yticklabels=labels)
-        plt.title("Confusion Matrix")
-        # Save the plot
-        chart_filename = f"{name}/confusion_matrix.png"
-        plt.savefig(chart_filename, dpi =100)
-        plt.close()
+
+        # Ensure the directory exists before saving the plot
+        if not os.path.exists(name):
+            os.makedirs(name)
+
+        confusion_matrix_plot(y_true=y_test, y_pred=y_pred, labels=labels, name=name)
 
         # Log the accuracy and classification report
         logging.info(f"Accuracy: {accuracy:.4f}")
-        #logging.info("Confusion Matrix:\n")
-        #logging.info(f"{cm}")
         logging.info("Classification Report:\n")
         logging.info(report)
 
@@ -611,7 +638,7 @@ def classification(name, df, api_key):
         return None
 
 # Perform Clustering  with KMeans
-def kmeans_clustering(df, name, n_clusters=3):
+def kmeans_clustering(name, df, api_key, n_clusters=3):
     """
     Perform KMeans clustering, generate a clustering graph, and return useful values.
     
@@ -643,6 +670,7 @@ def kmeans_clustering(df, name, n_clusters=3):
         # Handle missing values using SimpleImputer (mean imputation for simplicity)
         imputer = SimpleImputer(strategy='mean')
         df_cleaned[numeric_cols] = imputer.fit_transform(df_cleaned[numeric_cols])
+        logging.info("Imputation of missing values applied using mean strategy.")
 
         # Extract features for clustering
         X = df_cleaned[numeric_cols].values
@@ -658,30 +686,36 @@ def kmeans_clustering(df, name, n_clusters=3):
         # Perform PCA if more than 2 dimensions (for visualization purposes)
         if X_scaled.shape[1] > 2:
             pca = PCA(n_components=2)
-            X_scaled = pca.fit_transform(X_scaled)
+            X_scaled_pca = pca.fit_transform(X_scaled)
+        else:
+            X_scaled_pca = X_scaled
+
+        sns.set_theme(style="whitegrid")
 
         # Plot the clusters
-        plt.figure(figsize=(8, 6), dpi =100)
-        plt.scatter(X_scaled[:, 0], X_scaled[:, 1], c=df_cleaned['Cluster'], cmap='viridis', marker='o', s=50)
+        plt.figure(figsize=(10, 8), dpi =100)
+        scatter = plt.scatter(X_scaled_pca[:, 0], X_scaled_pca[:, 1], c=df_cleaned['Cluster'], cmap='viridis', marker='o', s=50, edgecolors='k', alpha=0.7, label='Data Points')
 
         # Plot cluster centers
-        if X_scaled.shape[1] == 2:
+        if X_scaled_pca.shape[1] == 2:
             plt.scatter(kmeans.cluster_centers_[:, 0], kmeans.cluster_centers_[:, 1], 
-                        c='red', s=200, marker='x', label='Cluster Centers')
+                        c='red', s=200, marker='x', label='Cluster Centers', linewidths=2)
         else:
             # Project cluster centers to 2D if PCA was applied
             cluster_centers_2d = pca.transform(kmeans.cluster_centers_)
             plt.scatter(cluster_centers_2d[:, 0], cluster_centers_2d[:, 1],
-                        c='red', s=200, marker='x', label='Cluster Centers')
+                        c='red', s=200, marker='x', label='Cluster Centers', linewidths=2)
 
         # Add labels and title
-        plt.title(f"KMeans Clustering with {n_clusters} clusters")
-        plt.xlabel("Principal Component 1" if X_scaled.shape[1] == 2 else "Feature 1")
-        plt.ylabel("Principal Component 2" if X_scaled.shape[1] == 2 else "Feature 2")
-        plt.legend(loc='best')
-
+        plt.title(f"KMeans Clustering with {n_clusters} clusters", fontsize=16, fontweight='bold')
+        plt.xlabel("Principal Component 1" if X_scaled_pca.shape[1] == 2 else "Feature 1", fontsize=14, fontweight='bold')
+        plt.ylabel("Principal Component 2" if X_scaled_pca.shape[1] == 2 else "Feature 2", fontsize=14, fontweight='bold')
+        plt.colorbar(scatter, label='Cluster')
+        plt.legend(loc='best', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
         # Generate a file name and save the plot
-        chart_file_name = f"{name}/clustering_graph.png"
+        chart_file_name = os.path.join(name, "clustering_graph.png")
         plt.savefig(chart_file_name, dpi =100)
         plt.close()  
 
@@ -691,7 +725,8 @@ def kmeans_clustering(df, name, n_clusters=3):
         return {
             "Cluster centres": kmeans.cluster_centers_,
             "Labels": df_cleaned['Cluster'].values,
-            "Inertia": kmeans.inertia_
+            "Inertia": kmeans.inertia_,
+            "PCA components": pca.components_ if X_scaled.shape[1] > 2 else None
         }
     
     except Exception as e:
@@ -723,79 +758,79 @@ def time_series(name, df, api_key):
         return None
     
      # Extract column names and a sample of the dataset to pass to LLM   
-    column_info = df_cleaned.columns.tolist()
+    column_info = "\n".join([f"{col}: {dtype}" for col, dtype in df_cleaned.dtypes.items()])
     example_data = df_cleaned.head(1).to_dict(orient="records")
 
     # Send a prompt to the LLM to suggest appropriate columns for classification
     prompt = f"""\
         Dataset columns: {column_info}. Sample row: {example_data}.
-        Task: Identify the column representing dates/times (Time Column) and the column with numeric values (Value Column) for a time series task.Ensure that the Value Column is not included in the Time Column.Return the names of the selected columns.
-        Output format:
-        {{"time": "time_column","value": "value_column"}}
+        Task: Identify the column representing dates/times (date Column) and numerical column for a time series task. Ensure that the numerical Column is not included in the date Column. Use function extract_time_series_data.
         """
     
-    # Get column selection suggestion from LLM
-    column_suggestion = chat(prompt, api_key)
+    response = chat_function_call(prompt=prompt, api_key=api_key, function_descriptions=filter_function_descriptions)
     
-    if not column_suggestion:
-        logging.error("Failed to get column suggestion for classification from LLM.")
+    if not response:
+        logging.error("Failed to get column suggestion for time series from LLM.")
         return None
-
+    logging.debug(f"LLM Response: {response}")
     # Parse the LLM output 
     try:
-        # Parse the suggested columns from the LLM response 
-        column_suggestion = json.loads(column_suggestion.strip())
-
-        # Extract time and value columns
-        time_column = column_suggestion.get("time")
-        value_column = column_suggestion.get("value")
+        params = json.loads(response['arguments'])
+        logging.info(f"Parsed parameters: {params}") 
+    except (json.JSONDecodeError, NameError, SyntaxError, KeyError) as e:
+        logging.error(f"Error processing response: {e}")
+        return None 
+    
+    # Parse the LLM output 
+    try:
+        logging.info('Starting Time series analysis...')
+        date_col = params.get('date_column', None)
+        num_col = params.get('numerical_column', None)
+ 
+        if isinstance(date_col, list):
+            date_col = date_col[0]
+        if isinstance(num_col, list):
+            num_col = num_col[0]
 
         # Validate the suggestion
-        if not time_column or not value_column:
+        if not date_col or not num_col:
             logging.error("Invalid suggestion from LLM: Missing 'time' or 'value' columns.")
             return None
         
         # Ensure the time column and value column exist in the dataframe
-        if time_column not in df_cleaned.columns or value_column not in df_cleaned.columns:
-            logging.error(f"The suggested columns '{time_column}' or '{value_column}' do not exist in the dataframe.")
+        if date_col not in df_cleaned.columns or num_col not in df_cleaned.columns:
+            logging.error(f"The suggested columns '{date_col}' or '{num_col}' do not exist in the dataframe.")
             return None
+        logging.debug(f"Extracted date column: {date_col}")
+        logging.debug(f"Extracted numerical column: {num_col}")
         
         # Ensure the time column is in datetime format
-        df_cleaned[time_column] = pd.to_datetime(df_cleaned[time_column], errors='coerce')
-
+        df_cleaned[date_col] = df_cleaned[date_col].apply(lambda x: parser.parse(x, fuzzy=True) if isinstance(x, str) else pd.NaT)
+        data = df_cleaned.set_index(date_col).sort_index()
+        
         # Drop rows where the time column is invalid or value column is NaN
-        df_cleaned = df_cleaned.dropna(subset=[time_column, value_column])
+        data = data.dropna(subset=[num_col])
 
     except Exception as e:
-        logging.error(f"Error while parsing LLM suggestion: {e}")
+        logging.error(f"Error while parsing LLM suggestion or extracting columns: {e}")
         return None
     try:
         
         # Perform the Augmented Dickey-Fuller (ADF) test
-        adf_result = adfuller(df_cleaned[value_column])
+        adf_result = adfuller(data[num_col])
         adf_statistic, p_value, _, _, critical_values, _ = adf_result
 
         # Decompose the time series
-        decomposition = seasonal_decompose(df_cleaned[value_column], model='multiplicative', period=12)
+        decomposition = seasonal_decompose(data[num_col], model='multiplicative', period=12)
         trend = decomposition.trend.dropna()
         seasonal = decomposition.seasonal.dropna()
         residual = decomposition.resid.dropna()
 
-        # Generate the time series plot
-        plt.figure(figsize=(10, 6), dpi =100)
-        plt.plot(df_cleaned[time_column], df_cleaned[value_column], marker='o', linestyle='-', color='b')
-
-        # Customize plot labels and title
-        plt.xlabel("Time")
-        plt.ylabel(value_column)
-        plt.title(f"Time Series Plot: {name}")
-        
-        # Save the plot
-        chart_filename = f"{name}/time_series.png"
-        plt.savefig(chart_filename, dpi =100)
-        plt.close()
+        # Call time_series_graph to generate and save the graph
+        chart_filename = time_series_graph(name=name, data=data, num_col=num_col)
 
         logging.info(f"Time series plot successfully saved as {chart_filename}")
+        
         return {
             "adf_statistic": adf_statistic,
             "adf_p_value": p_value,
@@ -806,60 +841,306 @@ def time_series(name, df, api_key):
         }
 
     except Exception as e:
-        logging.error(f"Error generating Time series graph: {e}")
+        logging.error(f"Error generating Time series graph or performing analysis: {e}")
         return None
 
-# Narrate a story
-def create_story_and_markdown(name, description, api_key, model='gpt-4o-mini'):
+# Function to generate and save the time series graph
+def time_series_graph(name, data, num_col):
     """
-    Generates a compelling data analysis story in markdown format and saves it as README.md.
+    Plots and saves the time series graph.
     """
-    proxy_url = 'https://aiproxy.sanand.workers.dev/openai/v1/chat/completions'
+    try:
+        # Generate the time series plot
+        plt.figure(figsize=(10, 6), dpi=100)
+        plt.plot(data.index, data[num_col], marker='o', markersize=5, linestyle='-', color='teal', linewidth=2)
 
+        # Customize plot labels and title
+        plt.xlabel("Time", fontsize=16, fontweight='bold')
+        plt.ylabel(num_col, fontsize=16, fontweight='bold')
+        plt.title(f"Time Series Plot: {name}", fontsize=18, fontweight='bold')
+        plt.grid(True, linestyle='--', color='gray', alpha=0.6)
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+
+        # Save the plot
+        chart_filename = os.path.join(name, "time_series.png")
+        plt.savefig(chart_filename, dpi=100)
+        plt.close()
+
+        logging.info(f"Time series plot successfully saved as {chart_filename}")
+        return chart_filename
+    except Exception as e:
+        logging.error(f"Error generating time series graph: {e}")
+        return None
+
+def regression_plot(name, y_true, y_pred, title='Actual vs Predicted', label='y = x'):
+    """Plot regression chart.
+
+    Args:
+        name (str): The directory where the plot will be saved.
+        y_true (array-like): The true target values.
+        y_pred (array-like): The predicted values.
+        title (str): The title of the plot (default 'Actual vs Predicted').
+        label (str): The label for the line (default 'y = x').
+
+    Returns:
+        str: The path to the saved regression plot.
+    """
+    # Ensure the directory exists
+    if not os.path.exists(name):
+        os.makedirs(name)
+
+    dpi = 100
+    plt.figure(figsize=(8, 6), dpi=dpi)
+
+    # Scatter plot of actual vs predicted values
+    plt.scatter(y_true, y_pred, alpha=0.8, color='royalblue', label="Predicted vs Actual", s=50)
+
+    # Plot the line y = x
+    plt.plot(y_true, y_true, color='crimson', label=label, linewidth=2)
+
+    # Set plot labels and title
+    plt.xlabel('Actual', fontsize=16, fontweight='bold')
+    plt.ylabel('Predicted', fontsize=16, fontweight='bold')
+    plt.title(title, fontsize=18, fontweight='bold')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=10)
+
+    # Save the plot to the specified directory
+    chart_file_name = os.path.join(name, "regression_plot.png")
+    try:
+        plt.savefig(chart_file_name, dpi=dpi)
+        logging.info(f"Regression plot saved as {chart_file_name}")
+    except Exception as e:
+        logging.error(f"Failed to save regression plot: {e}")
+    finally:
+        plt.close()
+
+    return chart_file_name
+
+def confusion_matrix_plot(y_true, y_pred, labels, name):
+    """
+    Plots and saves the confusion matrix.
+    """
+    try:
+        # Compute the confusion matrix
+        cm = confusion_matrix(y_true, y_pred)
+        
+        # Visualize the confusion matrix using a heatmap
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=labels, yticklabels=labels, cbar=True, annot_kws={"size": 14, "weight": "bold", "color": "black"}, square=True)
+        plt.title("Confusion Matrix", fontsize=18, fontweight='bold')
+        plt.xlabel('Predicted', fontsize=16, fontweight='bold')
+        plt.ylabel('True', fontsize=16, fontweight='bold')
+        
+        plt.xticks(rotation=45, ha='right', fontsize=14)
+        plt.yticks(rotation=45, va='top', fontsize=14)
+        plt.tight_layout()
+        # Save the plot to the specified filename
+        chart_filename = os.path.join(name, "confustion_matrix.png")
+        plt.savefig(chart_filename, dpi=100)
+        plt.close()
+        logging.info(f"Confusion matrix plot saved to {chart_filename}")
+        
+    except Exception as e:
+        logging.error(f"Error plotting confusion matrix: {e}")
+
+
+analysis_map = {
+    'regression': regression,
+    'kmeans_clustering': kmeans_clustering,
+    'classification': classification,
+    'time_series': time_series
+}
+
+def choose_analysis(name, data, api_key, analyses):
+    """Perform all the provided analysis functions."""
+    results = {}
+    for analysis in analyses:
+        analysis_normalized = analysis.strip().lower()
+        func = analysis_map.get(analysis_normalized)
+        
+        if func:
+            try:
+                res = func(name, data, api_key)
+            except Exception as e:
+                logging.error(f'Error in {analysis} function: {str(e)}')
+                res = None
+
+            if res is not None:
+                results[analysis] = res
+        else:
+            logging.warning(f"Analysis function {analysis} is not recognized.")
+    
+    return results
+
+
+def perform_ml_analysis(name, df, api_key):
+    """
+    Perform in-depth analysis by consulting a language model (LLM) to suggest 
+    appropriate machine learning techniques based on the provided dataset.
+    """
+    # Data cleaning
+    df_cleaned = clean_data(df)
+    if df_cleaned.empty or df_cleaned.shape[1] == 0:
+        logging.error("The dataset is empty or has no usable columns.")
+        return None
+    
+    analyses = ['regression','kmeans_clustering','classification','time_series']
+
+    analysis_function_descriptions = [
+        {
+            'name': 'choose_analysis',
+            'description': 'A function to choose all the relevant analysis to be performed for a dataset.',
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "analyses": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "List of analysis to perform in order. Eg. ['regression', 'time_series', 'kmeans_clustering']",
+                    },
+                },
+                "required": ["analyses"]
+            }
+        }
+    ]
+    # Columns info to provide context to the LLM
+    columns_info = "\n".join([f"{col}: {dtype}" for col, dtype in df_cleaned.dtypes.items()])
+    example_data = df_cleaned.head(1).to_dict(orient="records")
+    
+    order_list_analyses = "\n".join([f'{i+1}. {analysis_name}' for (i, analysis_name) in enumerate(analyses)])
+    
+    prompt = f"""\
+    You are given a file {name}.csv. With features:{columns_info}
+    Sample: {example_data}
+    Note: Perform only the appropriate analyses.
+    Analysis options: {order_list_analyses}
+    Call the choose_analysis function with the correct options.
+    """
+    # Call the LLM API
+    response = chat_function_call(prompt=prompt, api_key=api_key, function_descriptions=analysis_function_descriptions)
+
+    try:
+        params = json.loads(response['arguments'])
+    except (KeyError, json.JSONDecodeError) as e:
+        logging.error(f"Error parsing arguments from model response: {e}")
+        return None
+    analysis_func_name = response.get('name', '').strip().lower()
+    # Ensure that the LLM returns 'choose_analysis' and not another function name
+    if analysis_func_name != "choose_analysis":
+        logging.error(f"Invalid function name returned by the model: {analysis_func_name}. Expected 'choose_analysis'.")
+        return None
+    logging.info(f"In-depth Analysis suggested by LLM: {params}")
+    # Directly call the 'choose_analysis' function
+    analysis_results = choose_analysis(name, df_cleaned, api_key, **params)
+    return analysis_results
+
+
+# Narrate a story
+def create_story(name, description, image_files, api_key, model='gpt-4o-mini'):
+    """
+    Generates a compelling data analysis story in markdown format with embedded images using relative URLs
+    pointing directly to the image filenames.
+    
+    Parameters:
+    - name (str): Name of the dataset
+    - description (str): Generic and in-depth data analysis.
+    - image_files (list): List of image file paths (relative) to be included in the markdown.
+    - api_key (str): API key for the external AI service.
+    - model (str): The AI model to use (default is 'gpt-4o-mini').
+    
+    Returns:
+    - str: The generated markdown content for the README.md.
+    """
+    if not description or not image_files or not api_key:
+        raise ValueError("Description, image files, API key, and image folder are required")
+
+    # API URL for AI model
+    url = 'https://aiproxy.sanand.workers.dev/openai/v1/chat/completions'
+
+    # Headers for the API request
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}"
     }
+
+    # Prepare the images using relative URLs
+    image_urls = [f"![Image]({image_file})" for image_file in image_files]
+
+    prompt = f"Given dataset: {name}.csv\nData: {description}. Craft an engaging, in-depth narrative analysis in markdown format, highlighting key insights, trends, and actionable recommendations. Weave a story with creativity, bringing the data to life. Include images at relevant points using relative filenames (no full paths), placed logically within the narrative.The images should be referenced as markdown-style image links: {', '.join(image_urls)}"
+
+    # Payload for the API request
     payload = {
         'model': model,
         "messages": [
-            {
-                'role': 'system', 
-                'content': "You are a data analyst and storyteller. Present your findings as a creative and compelling narrative."
-            },
-            {
-                'role': 'user', 
-                'content': f"Data: {description}. Craft an engaging, story-driven analysis in markdown (README.md format), with clear sections. Highlight key insights, trends, and actionable recommendations. Make it engaging with plot, characters, and dialogues to bring the data to life."
-            }
+            {'role': 'system', 'content': "You are a data analyst and storyteller. Present your findings as a creative and compelling narrative."},
+            {'role': 'user', 'content': prompt},
         ],
         'temperature': 0.7,
-        'max_tokens': 1500
+        'max_tokens': 1800
     }
-    try:
-        response = requests.post(url=proxy_url, headers=headers, json=payload)
-        if response.ok:
-            ai_response = response.json()
-            result = ai_response["choices"][0]["message"]["content"].strip()
 
-            # Ensure directory exists
-            if not os.path.exists(name):
-                logging.info(f"Directory {name} does not creating it.")
-                os.makedirs(name)
-            
-            # Write the result to a README.md file
+    try:
+        # Send request to the AI API
+        logging.info("Sending request to the AI API...")
+        response = requests.post(url=url, headers=headers, json=payload, timeout=60)
+        
+        if response.ok:
             try:
-                with open(f"{name}/README.md", "w", encoding="utf-8") as f:
-                    f.write(result)
-                logging.info(f"Successfully written to {name}/README.md")
-            except Exception as e:
-                logging.error(f"Error writing README.md: {e}")
+                ai_response = response.json()  # Try to parse the JSON response
+                
+                # Check if 'choices' and other required keys are present
+                if 'choices' in ai_response and ai_response['choices']:
+                    result = ai_response["choices"][0]["message"]["content"].strip()
+                    
+                    logging.info(f"Monthly Cost: {ai_response.get('monthlyCost', 'N/A')}")
+                    logging.info(f"Request successful, generated story.")
+                    return result
+                else:
+                    # If the response doesn't have 'choices', log an error and raise an exception
+                    logging.error("Invalid AI response: Missing 'choices' or 'message' content.")
+                    raise ValueError("Error: Missing 'choices' or 'message' content in the AI response.")
+            
+            except ValueError as e:
+                logging.error(f"Error parsing AI response: {e}")
+                raise
+            except KeyError as e:
+                logging.error(f"Missing expected key in AI response: {e}")
+                raise
+            except requests.exceptions.JSONDecodeError as e:
+                logging.error(f"Failed to decode JSON from AI response: {e}")
+                raise
+        
         else:
+            # If the response status is not OK, log the error and raise an exception
             logging.error(f"Error fetching the summary. Status code: {response.status_code}")
-            logging.error(f"Response content: {response.content}")
+            logging.error(f"Response content: {response.content.decode('utf-8')}")
+            raise RuntimeError(f"Error: Unable to fetch the analysis. Status code: {response.status_code}")
+    
             
     except requests.exceptions.RequestException as e:
         logging.error(f"Request failed: {e}")
+        raise RuntimeError(f"Error: Request failed due to {e}")
 
+def clean_image_urls(markdown_content):
+    """
+    Cleans image URLs by removing directory paths, leaving only filenames.
+    For example: '![Image](media\\correlation_matrix.png)' becomes '![Image](correlation_matrix.png)'.
+    
+    Args:
+    - markdown_content (str): The markdown text with image URLs.
+    
+    Returns:
+    - str: The cleaned markdown content with proper image URLs.
+    """
+    # Regular expression to remove directory path before the image filename
+    # This pattern finds `![Image](...)` and removes any directory path (e.g., `media\`)
+    cleaned_content = re.sub(r'!\[Image\]\((.*?)\\(.*?)\)', r'![Image](\2)', markdown_content)
+    
+    return cleaned_content
 
 # Main function
 def main():
@@ -881,31 +1162,17 @@ def main():
 
     outlier_plot(name,df)
     correlation_matrix(name,df)
-    ml_results = perform_ml_analysis(name, df, api_key)
+    ml_analysis = perform_ml_analysis(name=name, df=df, api_key=api_key)
 
     list_chart = []
     for filename in os.listdir(name):
         if filename.endswith('.png'):
-            list_chart.append(os.path.join(name, filename))
-    image_data = [encode_image(image) for image in list_chart]
-    description = {"general analysis": analysis,"in-depth analysis": ml_results, "charts": image_data}
-    
-    # print(description)
-    create_story_and_markdown(name, description, api_key, model='gpt-4o-mini')
-    
-    readme_path = os.path.join(name, 'README.md')
-    with open(readme_path, 'a') as readme_file:
-        for chart in list_chart:
-            # Extract the base name of the chart (e.g., 'confusion_matrix.png')
-            chart_name = os.path.basename(chart).split('.')[0]
-            
-            # Add heading (e.g., Confusion Matrix)
-            readme_file.write(f"\n\n## {chart_name.replace('_', ' ').title()}\n")
-            
-            # Add image (markdown format: ![alt text](image_path))
-            relative_image_path = os.path.relpath(chart, name)
-            readme_file.write(f"![{chart_name}]({relative_image_path})\n")
-
+            relative_path = os.path.relpath(os.path.join(name, filename), start='.')  # Relative to the current directory
+            list_chart.append(relative_path)
+    description = {"generic_analysis": analysis, "ml_analysis": ml_analysis}
+    content = create_story(name=name, description=description, image_files=list_chart, api_key=api_key)
+    processed_content = clean_image_urls(content)
+    write_file(name=name, text_content=processed_content)
     logging.info("Autolysis completed.")
 
 
